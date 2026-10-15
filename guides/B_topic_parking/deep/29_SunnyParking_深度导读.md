@@ -102,9 +102,126 @@ $$
 
 但这也造成分布偏置。论文的定性结果显示，模型有时将原本 1-shot 的 GT 预测为 3-shot；作者归因于训练集中 3/4-shot 占多数。它提醒我们：**学习到的“人类式换挡次数”是数据分布属性，不是由几何可行性自动推导的最优解。**
 
-## 3. 连续目标表示：从车位 pose 到 target-aware BEV
+## 3. 架构总览：连续目标条件化的双分支 planner
 
-### 3.1 为什么 rasterized goal 不够
+### 3.1 按 Figure 2 走完一次前向传播
+
+Figure 2 容易让人误以为模型只是“一个 BEV encoder 后面加两个 decoder”。实际上它有两条输入流、两次含义不同的 attention 融合，以及一条从 trajectory branch 单向流向 motion branch 的依赖。最简洁的阅读方式是从左到右看：
+
+```text
+Input A: 4 × RGB images                         Input B: selected slot pose
+            │                                         S = (x_s, y_s, theta_s)
+            ▼                                                   │
+      image backbone                                             ▼
+            │                                  position Fourier + yaw sin/cos
+            ▼                                                   │
+       lift-splat                                                ▼
+            │                                                  MLP
+            ▼                                                   │
+  F_spatial: BEV scene feature                 learned spatial queries + goal vector
+            │                                                   │
+            └────────────── K, V ── cross-attention ── Q ─────┘
+                                           │
+                                           ▼
+                           F_target-aware: target-aware BEV feature
+                                           │
+                         ┌─────────────────┴─────────────────┐
+                         ▼                                   │
+             trajectory Transformer branch                   │
+                         │                                   │
+             hidden trajectory features H_T                  │
+                         │                                   │
+                         └── cross-attend into motion queries┘
+                                                             ▼
+                                              motion-state Transformer branch
+                         │                                   │
+                         ▼                                   ▼
+       trajectory sequence {(x_t,y_t,theta_t)}    state sequence {forward_t, reverse_t}
+                         \___________________________  ___________________________/
+                                                     one-to-one at every t
+```
+
+下面按模块解释。这里的符号是为理解数据流而写的紧凑记法，不表示论文公开了全部 tensor shape、head 数或层数；这些实现细节在正文中没有完整给出。
+
+#### Step A - 从环视图像获得“环境在哪里”
+
+四路环视 RGB 先经 image backbone 提取视角特征，再由 lift-splat 投影到俯视空间，得到 BEV spatial feature $F_{spatial}$。这一支回答的是：障碍物、车位线、地面边界和自车周边的视觉几何在哪里。
+
+它仍是 **BEV 环境表示**，不是把整个模型改成不使用 grid。论文训练设定里 BEV 覆盖 20 m × 20 m、大小为 `200 × 200`；SunnyParking 的连续性只针对车位目标如何进入网络，而非取消环境 BEV。
+
+#### Step B - 从连续车位 pose 构造“该去哪里”
+
+目标车位不是画入 BEV 的 mask，而是以 $S=(x_s,y_s,\theta_s)$ 单独走一条条件分支：
+
+$$
+S \rightarrow [x_s,y_s,\gamma(x_s),\gamma(y_s),\sin\theta_s,\cos\theta_s]
+\rightarrow \mathrm{MLP} \rightarrow t_{global}.
+$$
+
+其中 $\gamma$ 是多频 Fourier mapping。接着，$t_{global}$ 加到每个可学习 spatial query $s_j$ 上，形成目标条件 query：
+
+$$
+q_j=s_j+t_{global}.
+$$
+
+Figure 2 中的 `Query Infusion` 就是这一步；随后还经过 self-attention。直觉上，每个空间 query 都同时带有“我原来代表 BEV 的哪个位置”和“现在要去哪个连续车位”的信息。
+
+#### Step C - 第一次 attention：让目标决定从环境中读什么
+
+在 Cross-domain Target Fusion 中，目标条件化 queries 为 $Q$，BEV spatial feature 为 Key/Value：
+
+$$
+F_{target-aware}=\mathrm{CrossAttn}(Q_{goal},K=F_{spatial},V=F_{spatial}).
+$$
+
+这一层不是在预测轨迹；它只产生“对于这个 slot 已经重加权过”的场景特征。若把目标从左车位移动到右车位，环境图 $F_{spatial}$ 可以相同，但 $Q_{goal}$ 改变，因此网络会从不同的空间区域取证。这就是连续 slot pose 实际进入 planner 的位置。
+
+#### Step D - trajectory branch：先回答“车身中心线怎样走”
+
+YUKUI 的 trajectory branch 用自己的 learnable trajectory queries 查询 $F_{target-aware}$，产生未来 waypoint 的表示 $H_T$，再解码成 trajectory sequence。论文将位置/朝向做序列化，以 token 形式组织生成；在物理空间中，对应的是未来点的 $(x_t,y_t,\theta_t)$。
+
+因此这个分支的职责是几何：它不先预测 gear，也不直接输出 steering/throttle。若只保留这一个分支，模型本质上接近“以更好目标融合实现的 ParkingE2E 类 trajectory generator”。
+
+#### Step E - 第二次 attention：让状态分支读懂“这条轨迹意味着前进还是倒车”
+
+motion branch 并不是平行地从 BEV 直接分类。它先让 motion queries 对 trajectory hidden feature $H_T$ 做 cross-attention，再用更轻的 Transformer decoder 从 $F_{target-aware}$ 读取空间上下文：
+
+$$
+Q_{motion}'=\mathrm{CrossAttn}(Q_{motion},K=H_T,V=H_T),
+$$
+
+$$
+H_M=\mathrm{MotionDecoder}(Q_{motion}',K=F_{target-aware},V=F_{target-aware}).
+$$
+
+最后 $H_M$ 输出逐点 forward/reverse logits。这个顺序很关键：motion state 不是只看当前图像问“应该倒车吗”，而是看 **trajectory branch 已打算画出的那条轨迹**，再给每一段赋方向。论文的设计意图是降低“几何轨迹像倒车弧线、状态却预测前进”这一类不一致。
+
+#### Step F - 两个输出如何对齐，以及它们没有如何闭环
+
+两条输出在时间维度上逐点对齐：
+
+| 预测时刻 | trajectory branch | motion branch | 可解释的 maneuver 含义 |
+|---:|---|---|---|
+| $t=1$ | $(x_1,y_1,\theta_1)$ | forward / reverse | 起始小段应如何运动 |
+| $t=2$ | $(x_2,y_2,\theta_2)$ | forward / reverse | 延续或接近切换 |
+| $\ldots$ | $\ldots$ | $\ldots$ | $\ldots$ |
+| $t=30$ | $(x_{30},y_{30},\theta_{30})$ | forward / reverse | 该窗口末段的方向 |
+
+训练时，trajectory 以 MSE 与专家点序列对齐；motion 以 cross-entropy 和 shift-aware smoothness 对齐。部署接口在原文中仍是预测序列本身：论文并没有给出一个“将 motion logits 转成 gear、先停车、再执行下一段”的闭环控制器，也没有用 vehicle model 强制 $m_t$ 与速度符号、零速和曲率一致。因此要将 Figure 2 正确理解成 **trajectory proposal + maneuver annotation**，而非已经闭合的 hybrid controller。
+
+### 3.2 三种 query 不要混为一谈
+
+Figure 2 里 query 出现三次，功能不同，是理解架构最容易卡住的地方：
+
+| Query | 在哪里 | 数量/语义 | 它解决的问题 |
+|---|---|---|---|
+| spatial queries | Fourier goal fusion | 与 BEV 网格位置对应的一组可学习 query | 连续 slot pose 应让模型关注哪一片环境 |
+| trajectory queries | trajectory branch | 面向未来 trajectory sequence 的 learnable query | 每个未来时刻的几何 waypoint 应是什么 |
+| motion queries | motion branch | 面向未来 state sequence 的 query，先吸收 $H_T$ | 同一时刻的 waypoint 是前进还是倒车执行 |
+
+也因此，SunnyParking 不是“目标向量直接喂给 Transformer，然后预测两个头”。它是先把目标转为 **空间注意力条件**，再将生成的几何计划变成 **状态分支的条件**。
+
+### 3.3 为什么 rasterized goal 不够
 
 若把目标车位中心和方向绘制在 0.1 m/pixel 的 BEV heatmap 中，位置在栅格边界附近发生小幅移动时，输入可能完全不变或突然跳一个 pixel。对一般车道级规划，这种近似未必致命；对窄车位终姿与换挡边界，10 cm 离散化会污染目标条件。
 
@@ -117,7 +234,7 @@ $$
 
 并将 $x'$、$y'$ 与其 Fourier features 连接；yaw 以 $[\sin\theta,\cos\theta]$ 表示，避免角度 $-\pi/\pi$ 不连续。论文声称该频率设置的理论分辨率约 1.2 cm，并给出 1-2 mm 的有效精度说法。这个数值反映的是 **编码表达能力**，而不是端到端实际停车误差。
 
-### 3.2 Cross-domain target fusion
+### 3.4 Cross-domain target fusion
 
 不要把它理解为“向视觉特征加一个 goal vector”。数据流是：
 
