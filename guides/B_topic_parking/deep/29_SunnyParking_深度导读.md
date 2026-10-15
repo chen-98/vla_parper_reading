@@ -239,6 +239,97 @@ Scheduled Sampling 从 epoch 5 到 25，将下一步输入为 GT token 的概率
 
 因此它是非常有启发的 representation paper，而不是已完成部署证明的 parking policy。
 
+### 6.5 与 ParkingE2E、OpenDriveVLA 的组会对照：不要把三种“连续性”混在一起
+
+如果组内已经分享过 ParkingE2E 与 OpenDriveVLA，SunnyParking 最值得讨论的并不是“它也用了 Transformer/VLM 风格的 query”，而是它在 **目标表示** 和 **动作表示** 两个接口上同时改变了问题。先分清三个容易混淆的概念：
+
+1. **连续目标条件（goal representation）**：车位终点以连续 pose 还是 BEV 栅格/heatmap 给模型；
+2. **连续轨迹语义（trajectory in physical space）**：部署给控制器的是不是米制 waypoint；
+3. **离散生成形式（decoder representation）**：网络内部是直接回归坐标，还是将坐标量化为 token 后自回归生成。
+
+三者不是一回事。SunnyParking 的第一个接口是连续的，第二个接口也是米制 trajectory，但第三个接口仍带有 tokenization；因此不能笼统说它是“纯连续生成”。
+
+#### 6.5.1 方法矩阵
+
+| 维度 | ParkingE2E | SunnyParking | OpenDriveVLA |
+|---|---|---|---|
+| 任务 | 指定车位的实车泊车 | 指定车位的 multi-shot 泊车 | 城市道路的语言条件轨迹规划，不是车位入位 |
+| 目标/意图输入 | 将指定车位**栅格化为 BEV target heatmap**，CNN 得到 target feature | 直接编码连续 slot pose `(x,y,yaw)`；位置用 Fourier features，yaw 用 `sin/cos` | 没有停车终点 pose；输入为 ego state + 高层驾驶 command 文本 + scene/agent/map visual tokens |
+| 环境表示 | 环视 RGB lift-splat 到 BEV，`200 × 200`，20 m × 20 m，即 0.1 m/pixel | 环视 RGB 到 BEV；论文训练设定同为 20 m × 20 m、`200 × 200` | 2D/3D instance-aware token；内部 BEV feature map 为 `200 × 200` |
+| 轨迹输出的物理含义 | 自回归未来 `(x,y)` waypoint，交给 RWF + PID 跟踪 | 未来 trajectory（含位置/朝向）+ 每点 forward/reverse state | 3 s 内 6 个 `(x,y)` ego waypoint，条件于 command |
+| 解码形式 | `(x,y)` 坐标量化为 token，自回归 Transformer 解码，`N_t=1200` | 位置/朝向量化 token 序列；trajectory branch 后接 motion-state branch，`N_u=1200` | 6 个 waypoint 量化为 LLM 的文本/离散 trajectory tokens，自回归生成 |
+| 关键 action abstraction | 单一 waypoint 序列 | `trajectory + direction state` 的 hybrid action | 语言条件的短时 waypoint；未显式建模 gear/maneuver state |
+| 主要证据 | 四个真实车库闭环，论文报告平均 87.8% success | CARLA 静态停车场的开环轨迹/换挡点预测；无完整闭环成功率 | nuScenes 开环规划 + QA；没有停车闭环证据 |
+
+这张表的第一条结论是：**SunnyParking 和 ParkingE2E 的根本差异不是“一个是连续轨迹、一个不是”。** ParkingE2E 最终也会解出米制 waypoint 给控制器；SunnyParking 的 decoder 也会将坐标序列化。更准确的说法是：
+
+```text
+ParkingE2E：goal 先栅格化；action 只有 trajectory
+SunnyParking：goal 保持连续 pose；action = trajectory + forward/reverse state
+OpenDriveVLA：没有精确 slot goal；以语言 command 条件化短时 trajectory
+```
+
+#### 6.5.2 SunnyParking 的连续 goal 到底改变了什么
+
+ParkingE2E 的 target encoder 明确先在 BEV 中生成 target heatmap，再以 CNN 得到 $F_{target}$，并用该 feature 查询 camera BEV feature。它的优点是：目标与障碍、车位线、可行驶空间处在同一张空间图上，attention 的位置对应关系很直观；该系统还在真实车辆中成功接上控制器。
+
+代价是，输入车位 pose 必须经过 BEV 栅格化。对于其 $[-10,10]$ m、`200 × 200` 设置，基础 grid 间距为 0.1 m。即使 heatmap/CNN 可以学习亚栅格的补偿，目标在 cell 边界附近的微小变化也不再以原始连续值、原始 yaw 直接传给 decoder。这是 **goal quantization** 问题，不等于网络所有 feature 都只能有 0.1 m 精度。
+
+SunnyParking 保留了环境 BEV，因此它没有放弃 BEV 的局部几何与可解释性；不同之处只在 goal path：
+
+$$
+S=(x_s,y_s,\theta_s)
+\xrightarrow{\text{Fourier + }[\sin\theta_s,\cos\theta_s]}
+t_{global}
+\xrightarrow{\text{target-infused spatial queries}}
+F_{enhanced}.
+$$
+
+这样，slot 的位置和朝向以连续变量改变 query，而不是先被画成一块固定大小的 BEV 图案。对窄车位、车位边缘、初始姿态微扰和最终 heading tolerance，这个归纳偏置是合理的。论文中 Fourier+motion 的完整模型比 Fourier trajectory-only 模型的 L2 从 2.863 m 降到 1.065 m，也优于对应 BEV+motion 的 1.474 m；但这两个变化同时涉及 state branch，不能把全部收益简单归于 Fourier encoding。严格验证应保持 decoder 和 state branch 不变，只替换 heatmap goal 与 Fourier goal。
+
+#### 6.5.3 OpenDriveVLA 为什么不是“连续目标 vs BEV 目标”的直接对照
+
+OpenDriveVLA 是很好的 VLA 方法论参照，却不是 SunnyParking 的 target-representation baseline。它处理的是城市道路：高层 command 如“直行/右转”提供的是**语义意图**，并非“在 `(x,y,\theta)` 车位终止”的度量目标。模型用 2D/3D scene、agent、map token，ego state 和 command 驱动 LLM，生成 3 秒、每 0.5 秒采样的 6 个 `(x,y)` waypoint token。它的 `200 × 200` BEV 主要服务于环境/agent/map token 提取，而不是将一个停车终点画成 goal heatmap。
+
+所以组会里不宜说“OpenDriveVLA 也用连续目标”。更严谨的表述是：
+
+- **OpenDriveVLA 的强项**：用多阶段 vision-language alignment、agent-environment-ego 辅助建模，把高层语言意图接到空间化的短时轨迹；
+- **它没有解决的泊车接口**：厘米级 slot pose grounding、forward/reverse/stop/gear transition、长时 multi-shot completion，以及停车闭环恢复；
+- **SunnyParking 的强项**：为最后几十厘米的精确终止状态提供连续 goal grounding，并把最重要的离散 maneuver 边界显式化；
+- **它没有获得的 OpenDriveVLA 能力**：语言指令跟随、通用场景语义、对象级交互推理和规模化 VLM 先验。
+
+一个额外的工程信号是：OpenDriveVLA 论文在单张 A100 上报告的 0.5B 模型平均推理延迟约 1.36 s。即使这不是端到端控制周期的唯一测量，它也说明不能不加分层/快速轨迹头，就将这种自回归 VLA 直接放进高频、狭窄的泊车控制环。
+
+#### 6.5.4 一条可用于分享的主线
+
+可以把三篇论文讲成同一问题的三个层级：
+
+```text
+ParkingE2E：如何从图像和“一个目标车位”生成可被控制器跟踪的轨迹？
+    → 给出 heatmap goal + trajectory-only 的实车闭环基线
+
+SunnyParking：若车位很窄且需要多次前倒切换，目标与动作接口是否还够？
+    → 改成 continuous slot pose + trajectory/direction hybrid action
+
+OpenDriveVLA：如何让高层语言和 3D 场景语义影响轨迹？
+    → 用 VLA 对齐与交互 token，但尚未提供泊车的精确终止与 maneuver 接口
+```
+
+由此可以提出一个比“给停车模型加 LLM”更尖锐的研究问题：**语言应描述哪一层？** 对泊车，最值得语言化/可验证化的可能不是逐点 `(x,y)`，而是 `{目标车位, 入库方向, 首段前进或倒车, 允许换挡次数, 安全间距偏好, 终止条件}`；低层连续段仍由 SunnyParking/YUKUIv2 式 trajectory generator 与运动学安全层处理。
+
+#### 6.5.5 可证伪的后续实验
+
+若要证明 SunnyParking 的改动真正有价值，可在 ParkingE2E 的实车闭环协议上做一个 2 × 2 消融，避免将目标表示、网络容量和控制器变化混为一谈：
+
+| Goal interface | Action interface | 要回答的问题 |
+|---|---|---|
+| BEV heatmap | trajectory only | ParkingE2E 基线 |
+| Fourier continuous slot pose | trajectory only | 连续目标是否减少 cell-boundary/终姿误差？ |
+| BEV heatmap | trajectory + direction state | 显式 forward/reverse 是否改善 multi-shot？ |
+| Fourier continuous slot pose | trajectory + direction state | 两种接口是否互补？ |
+
+四组必须使用同一 perception backbone、trajectory horizon、controller、训练/测试车位划分和计算预算。除 L2/heading/shift-point error 外，还应报告：入位成功率、最终 pose 误差、换挡数、换挡前零速满足率、最小间距、碰撞/卡死率，以及对初始 pose 和 slot pose 的连续微扰曲线。这样才能把“更连续的目标表示”从漂亮的 encoding 动机，推进成闭环可验证的规划结论。
+
 ## 7. 与停车和 VLA 路线的关系
 
 ### 7.1 纯连续回归到分层 action representation
